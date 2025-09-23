@@ -1,4 +1,4 @@
-# 🎥 Zoom Clone – Real-Time Video Conferencing App
+# 🎥 Z-Connect – Real-Time Video Conferencing App
  A full-stack **Zoom-like video conferencing web app** that supports real-time **video/audio**, **screen sharing**, **chat**, and **guest access**, along with **meeting history** for logged-in users.
  Built using **WebRTC**, **Socket.io**, **React**, and **Node.js**.
 
