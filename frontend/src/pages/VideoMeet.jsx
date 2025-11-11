@@ -273,99 +273,156 @@ export default function VideoMeetComponent() {
 
 
 
-    let connectToSocketServer = () => {
-        socketRef.current = io.connect(server_url, { secure: false })
+ 
 
-        socketRef.current.on('signal', gotMessageFromServer)
+let connectToSocketServer = () => {
 
-        socketRef.current.on('connect', () => {
-            socketRef.current.emit('join-call', window.location.href)
-            socketIdRef.current = socketRef.current.id
+    socketRef.current = io.connect(server_url, { secure: false });
 
-            socketRef.current.on('chat-message', addMessage)
+    socketRef.current.on('signal', gotMessageFromServer);
 
-            socketRef.current.on('user-left', (id) => {
-                setVideos((videos) => videos.filter((video) => video.socketId !== id))
-            })
+    socketRef.current.on('connect', () => {
+        socketRef.current.emit('join-call', window.location.href);
+        socketIdRef.current = socketRef.current.id;
 
-            socketRef.current.on('user-joined', (id, clients) => {
-                clients.forEach((socketListId) => {
+        socketRef.current.on('chat-message', addMessage);
 
-                    connections[socketListId] = new RTCPeerConnection(peerConfigConnections)
-                    // Wait for their ice candidate       
-                    connections[socketListId].onicecandidate = function (event) {
-                        if (event.candidate != null) {
-                            socketRef.current.emit('signal', socketListId, JSON.stringify({ 'ice': event.candidate }))
-                        }
-                    }
+        socketRef.current.on('user-left', (id) => {
+            setVideos((videos) => videos.filter((video) => video.socketId !== id));
+        });
 
-                    // Wait for their video stream
-                    connections[socketListId].onaddstream = (event) => {
-                        console.log("BEFORE:", videoRef.current);
-                        console.log("FINDING ID: ", socketListId);
+        socketRef.current.on('user-joined', (id, clients) => {
+            clients.forEach((socketListId) => {
+                connections[socketListId] = new RTCPeerConnection(peerConfigConnections);
 
-                        let videoExists = videoRef.current.find(video => video.socketId === socketListId);
+                // Robust initiator/receiver selection for data channel:
+                // Always the peer with the LOWER socket ID creates the data channel for a given pair.
+                if (socketIdRef.current < socketListId) {
+                    // Initiator/creator for the pair
+                    connections[socketListId].latencyChannel = connections[socketListId].createDataChannel("latency");
 
-                        if (videoExists) {
-                            console.log("FOUND EXISTING");
-
-                            // Update the stream of the existing video
-                            setVideos(videos => {
-                                const updatedVideos = videos.map(video =>
-                                    video.socketId === socketListId ? { ...video, stream: event.stream } : video
-                                );
-                                videoRef.current = updatedVideos;
-                                return updatedVideos;
-                            });
-                        } else {
-                            // Create a new video
-                            console.log("CREATING NEW");
-                            let newVideo = {
-                                socketId: socketListId,
-                                stream: event.stream,
-                                autoplay: true,
-                                playsinline: true
-                            };
-
-                            setVideos(videos => {
-                                const updatedVideos = [...videos, newVideo];
-                                videoRef.current = updatedVideos;
-                                return updatedVideos;
-                            });
-                        }
+                    connections[socketListId].latencyChannel.onopen = () => {
+                        console.log(`Latency channel open for ${socketListId} (initiator client)`);
+                        setInterval(() => {
+                            const sentTimestamp = Date.now();
+                            connections[socketListId].latencyChannel.send(JSON.stringify({ type: "latency-probe", sentTimestamp }));
+                        }, 2000); // Probe every 2s
                     };
 
-
-                    // Add the local video stream
-                    if (window.localStream !== undefined && window.localStream !== null) {
-                        connections[socketListId].addStream(window.localStream)
-                    } else {
-                        let blackSilence = (...args) => new MediaStream([black(...args), silence()])
-                        window.localStream = blackSilence()
-                        connections[socketListId].addStream(window.localStream)
-                    }
-                })
-
-                if (id === socketIdRef.current) {
-                    for (let id2 in connections) {
-                        if (id2 === socketIdRef.current) continue
-
-                        try {
-                            connections[id2].addStream(window.localStream)
-                        } catch (e) { }
-
-                        connections[id2].createOffer().then((description) => {
-                            connections[id2].setLocalDescription(description)
-                                .then(() => {
-                                    socketRef.current.emit('signal', id2, JSON.stringify({ 'sdp': connections[id2].localDescription }))
-                                })
-                                .catch(e => console.log(e))
-                        })
-                    }
+                    connections[socketListId].latencyChannel.onmessage = (event) => {
+                        const msg = JSON.parse(event.data);
+                        const now = Date.now();
+                        if (msg.type === "latency-probe") {
+                            connections[socketListId].latencyChannel.send(JSON.stringify({
+                                type: "latency-response",
+                                originalTimestamp: msg.sentTimestamp
+                            }));
+                        } else if (msg.type === "latency-response") {
+                            const rtt = now - msg.originalTimestamp;
+                            console.log(`[LATENCY-CHECK][${socketListId}] RTT(ms): ${rtt}, sent: ${msg.originalTimestamp}, received: ${now}`);
+                            window.allLatencies = window.allLatencies || {};
+                            if (!window.allLatencies[socketListId]) window.allLatencies[socketListId] = [];
+                            window.allLatencies[socketListId].push({ rtt, sent: msg.originalTimestamp, recv: now });
+                        }
+                    };
+                } else {
+                    // Receiver for the pair; accept the data channel
+                    connections[socketListId].ondatachannel = (event) => {
+                        const latencyChannel = event.channel;
+                        latencyChannel.onopen = () => {
+                            console.log(`Latency channel open for ${socketListId} (answerer client)`);
+                        };
+                        latencyChannel.onmessage = (event) => {
+                            const msg = JSON.parse(event.data);
+                            const now = Date.now();
+                            if (msg.type === "latency-probe") {
+                                latencyChannel.send(JSON.stringify({
+                                    type: "latency-response",
+                                    originalTimestamp: msg.sentTimestamp
+                                }));
+                            } else if (msg.type === "latency-response") {
+                                const rtt = now - msg.originalTimestamp;
+                                console.log(`[LATENCY-CHECK][${socketListId}] RTT(ms): ${rtt}, sent: ${msg.originalTimestamp}, received: ${now}`);
+                                window.allLatencies = window.allLatencies || {};
+                                if (!window.allLatencies[socketListId]) window.allLatencies[socketListId] = [];
+                                window.allLatencies[socketListId].push({ rtt, sent: msg.originalTimestamp, recv: now });
+                            }
+                        };
+                    };
                 }
-            })
-        })
-    }
+
+                // ICE candidates wiring
+                connections[socketListId].onicecandidate = function (event) {
+                    if (event.candidate != null) {
+                        socketRef.current.emit('signal', socketListId, JSON.stringify({ 'ice': event.candidate }));
+                    }
+                };
+
+                // Video streams wiring
+                connections[socketListId].onaddstream = (event) => {
+                    console.log("BEFORE:", videoRef.current);
+                    console.log("FINDING ID: ", socketListId);
+
+                    let videoExists = videoRef.current.find(video => video.socketId === socketListId);
+
+                    if (videoExists) {
+                        console.log("FOUND EXISTING");
+                        setVideos(videos => {
+                            const updatedVideos = videos.map(video =>
+                                video.socketId === socketListId ? { ...video, stream: event.stream } : video
+                            );
+                            videoRef.current = updatedVideos;
+                            return updatedVideos;
+                        });
+                    } else {
+                        console.log("CREATING NEW");
+                        let newVideo = {
+                            socketId: socketListId,
+                            stream: event.stream,
+                            autoplay: true,
+                            playsinline: true
+                        };
+
+                        setVideos(videos => {
+                            const updatedVideos = [...videos, newVideo];
+                            videoRef.current = updatedVideos;
+                            return updatedVideos;
+                        });
+                    }
+                };
+
+                // Add local media tracks
+                if (window.localStream !== undefined && window.localStream !== null) {
+                    connections[socketListId].addStream(window.localStream);
+                } else {
+                    let blackSilence = (...args) => new MediaStream([black(...args), silence()]);
+                    window.localStream = blackSilence();
+                    connections[socketListId].addStream(window.localStream);
+                }
+            });
+
+            // SDP offer/answer for new arrivals
+            if (id === socketIdRef.current) {
+                for (let id2 in connections) {
+                    if (id2 === socketIdRef.current) continue;
+
+                    try {
+                        connections[id2].addStream(window.localStream);
+                    } catch (e) {}
+
+                    connections[id2].createOffer().then((description) => {
+                        connections[id2].setLocalDescription(description)
+                            .then(() => {
+                                socketRef.current.emit('signal', id2, JSON.stringify({ 'sdp': connections[id2].localDescription }));
+                            })
+                            .catch(e => console.log(e));
+                    });
+                }
+            }
+        });
+    });
+};
+
 
     let silence = () => {
         let ctx = new AudioContext()
